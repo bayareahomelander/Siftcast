@@ -87,11 +87,26 @@ def build_sim() -> Path:
     if SIM_EXE.exists() and SIM_EXE.stat().st_mtime >= src.stat().st_mtime:
         return SIM_EXE
     vcvars = find_vcvars()
-    cmd = (
-        f'call "{vcvars}" && cl /nologo /O2 /EHsc /std:c++17 '
-        f'/Fo:build\\ /Fe:build\\sim.exe sim.cpp'
+    # vcvars is its own argv. One string `call "…\vcvars64.bat" && cl` is
+    # list2cmdline-escaped (path has spaces) and cmd cannot find the bat.
+    subprocess.check_call(
+        [
+            "cmd",
+            "/c",
+            "call",
+            str(vcvars),
+            "&&",
+            "cl",
+            "/nologo",
+            "/O2",
+            "/EHsc",
+            "/std:c++17",
+            "/Fo:build\\",
+            "/Fe:build\\sim.exe",
+            "sim.cpp",
+        ],
+        cwd=str(ROOT),
     )
-    subprocess.check_call(["cmd", "/c", cmd], cwd=str(ROOT))
     if not SIM_EXE.exists():
         raise RuntimeError("sim.exe missing after compile")
     return SIM_EXE
