@@ -1,0 +1,12 @@
+[package]
+name = "siftcast-reconstruct"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "siftcast_reconstruct"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reconstruct"
+path = "src/main.rs"

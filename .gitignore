@@ -1,0 +1,12 @@
+/build/
+/reconstruct/target/
+/artifacts/*.bin
+/artifacts/*.jsonl
+/artifacts/*.npz
+/artifacts/*.json
+/artifacts/*.txt
+/artifacts/daily-min-temperatures.csv
+/__pycache__/
+/tests/__pycache__/
+*.obj
+*.exe
