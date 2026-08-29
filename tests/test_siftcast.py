@@ -131,6 +131,25 @@ def _toy_rows(n: int, seed: int = 1):
     return [{"seq": int(i), "x": float(x[i]), "y": float(x[i]), "trust": float(trust[i])} for i in range(n)]
 
 
+_TOY = None
+
+
+def _toy_model():
+    global _TOY
+    if _TOY is None:
+        rows = _toy_rows(160)
+        dest = ROOT / "artifacts" / "test_ckpt.npz"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        params, meta, _losses, _X, _split = sc.fit(
+            rows, steps=40, seed=2, ckpt=dest, lr=0.08, batch=16, horizon=8, coverage=0.90
+        )
+        _TOY = (rows, params, meta)
+    return _TOY
+
+
+_TARGET_FIELDS = ("trust_true", "x_observed_c", "x_oracle_c")
+
+
 def _assert_forecast_records(fc: dict, horizon: int):
     assert fc["horizon"] == horizon
     assert fc["model_type"] == sc.MODEL_TYPE
@@ -205,6 +224,150 @@ def test_rejects_schema_v1_checkpoint():
         msg = str(e).lower()
         assert "rerun" in msg and "training" in msg, e
     assert raised
+
+
+def test_infer_end_of_stream_prediction_only():
+    rows, params, meta = _toy_model()
+    h = int(meta["horizon"])
+    fc = sc.infer_forecast(params, meta, rows, origin_t=len(rows))
+    _assert_forecast_records(fc, h)
+    assert len(fc["forecast"]) == h
+    for rec in fc["forecast"]:
+        for k in _TARGET_FIELDS:
+            assert k not in rec, k
+
+
+def test_infer_default_origin_is_end_of_stream():
+    rows, params, meta = _toy_model()
+    omitted = sc.infer_forecast(params, meta, rows)
+    explicit = sc.infer_forecast(params, meta, rows, origin_t=len(rows))
+    assert omitted == explicit
+    for rec in omitted["forecast"]:
+        for k in _TARGET_FIELDS:
+            assert k not in rec, k
+
+
+def test_infer_retrospective_enrichment():
+    rows, params, meta = _toy_model()
+    h = int(meta["horizon"])
+    origin = int(meta["win"])
+    truth = {int(r["seq"]): float(r["x"]) + 0.25 for r in rows}
+    fc = sc.infer_forecast(params, meta, rows, truth_by_seq=truth, origin_t=origin)
+    _assert_forecast_records(fc, h)
+    for i, rec in enumerate(fc["forecast"]):
+        row = rows[origin + i]
+        assert rec["trust_true"] == float(row["trust"])
+        assert abs(rec["x_oracle_c"] - truth[int(row["seq"])]) < 1e-12
+        if rec["trust_true"] >= 0.5:
+            assert abs(rec["x_observed_c"] - float(row["x"])) < 1e-12
+        else:
+            assert "x_observed_c" not in rec
+
+
+def test_infer_held_omits_x_observed():
+    rows, params, meta = _toy_model()
+    h = int(meta["horizon"])
+    win = int(meta["win"])
+    origin = None
+    for t in range(win, len(rows) - h + 1):
+        if any(float(rows[t + k]["trust"]) < 0.5 for k in range(h)):
+            origin = t
+            break
+    assert origin is not None
+    truth = {int(r["seq"]): float(r["x"]) for r in rows}
+    fc = sc.infer_forecast(params, meta, rows, truth_by_seq=truth, origin_t=origin)
+    held = [rec for rec in fc["forecast"] if rec.get("trust_true", 1.0) < 0.5]
+    assert len(held) >= 1
+    for rec in held:
+        assert "x_observed_c" not in rec
+        assert "trust_true" in rec
+        assert "x_oracle_c" in rec
+
+
+def test_infer_origin_bounds():
+    rows, params, meta = _toy_model()
+    win = int(meta["win"])
+    for bad in (win - 1, 0, len(rows) + 1):
+        raised = False
+        try:
+            sc.infer_forecast(params, meta, rows, origin_t=bad)
+        except ValueError as e:
+            raised = True
+            msg = str(e)
+            assert "origin" in msg.lower()
+            assert str(bad) in msg
+            assert str(win) in msg
+            assert str(len(rows)) in msg
+        except IndexError:
+            raise AssertionError(f"origin_t={bad} raised IndexError, expected ValueError")
+        assert raised, bad
+
+
+def test_clustered_coverage_two_origins():
+    z = 1.959963984540054
+    p, lo, hi, g = sc.clustered_coverage_interval([8, 6], [10, 10])
+    assert g == 2
+    assert abs(p - 0.7) < 1e-15
+    se = 0.1
+    assert abs(lo - (0.7 - z * se)) < 1e-12
+    assert abs(hi - (0.7 + z * se)) < 1e-12
+    assert 0.0 <= lo <= hi <= 1.0
+
+
+def test_clustered_coverage_unequal_sizes_are_pooled():
+    p, lo, hi, g = sc.clustered_coverage_interval([9, 2], [10, 20])
+    assert g == 2
+    assert abs(p - (11.0 / 30.0)) < 1e-15
+    unweighted = (0.9 + 0.1) / 2.0
+    assert abs(p - unweighted) > 1e-6
+    u0 = 9 - p * 10
+    u1 = 2 - p * 20
+    se = math.sqrt(2.0 * (u0 * u0 + u1 * u1)) / 30.0
+    z = 1.959963984540054
+    assert abs(lo - max(0.0, p - z * se)) < 1e-12
+    assert abs(hi - min(1.0, p + z * se)) < 1e-12
+
+
+def test_clustered_coverage_invalid_and_g_lt_2():
+    def raises(fn):
+        try:
+            fn()
+        except ValueError:
+            return True
+        return False
+
+    assert raises(lambda: sc.clustered_coverage_interval([1], [1, 2]))
+    assert raises(lambda: sc.clustered_coverage_interval([-1], [1]))
+    assert raises(lambda: sc.clustered_coverage_interval([1], [-1]))
+    assert raises(lambda: sc.clustered_coverage_interval([2], [1]))
+    assert raises(lambda: sc.clustered_coverage_interval([0], [0]))
+    assert raises(lambda: sc.clustered_coverage_interval([0, 0], [0, 0]))
+    p, lo, hi, g = sc.clustered_coverage_interval([5], [10])
+    assert p == 0.5 and g == 1 and lo is None and hi is None
+    blob = json.dumps({"lo": lo, "hi": hi})
+    assert blob == '{"lo": null, "hi": null}'
+    p, lo, hi, g = sc.clustered_coverage_interval([5, 0], [10, 0])
+    assert p == 0.5 and g == 1 and lo is None and hi is None
+
+
+def test_evaluate_rolling_cluster_keys():
+    rows, params, meta = _toy_model()
+    truth = {int(r["seq"]): float(r["x"]) for r in rows}
+    m = sc.evaluate_rolling(params, meta, rows, truth)
+    assert m["observed_coverage_cluster_method"] == "origin_cluster_robust_normal"
+    assert int(m["observed_coverage_cluster_n_origins"]) >= 2
+    assert {k for k in m if k.startswith("observed_coverage_")} == {
+        "observed_coverage_cluster_lo",
+        "observed_coverage_cluster_hi",
+        "observed_coverage_cluster_n_origins",
+        "observed_coverage_cluster_method",
+    }
+    lo = m["observed_coverage_cluster_lo"]
+    hi = m["observed_coverage_cluster_hi"]
+    assert lo is not None and hi is not None
+    assert math.isfinite(lo) and math.isfinite(hi)
+    assert 0.0 <= lo <= hi <= 1.0
+    assert math.isfinite(m["observed_interval_coverage"])
 
 
 def test_calibrate_fails_without_trusted_scores():
@@ -332,6 +495,24 @@ if __name__ == "__main__":
     print("ok train_step")
     test_rejects_schema_v1_checkpoint()
     print("ok schema v1 reject")
+    test_infer_end_of_stream_prediction_only()
+    print("ok infer end-of-stream")
+    test_infer_default_origin_is_end_of_stream()
+    print("ok infer default origin")
+    test_infer_retrospective_enrichment()
+    print("ok infer retrospective")
+    test_infer_held_omits_x_observed()
+    print("ok infer held")
+    test_infer_origin_bounds()
+    print("ok infer bounds")
+    test_clustered_coverage_two_origins()
+    print("ok cluster two")
+    test_clustered_coverage_unequal_sizes_are_pooled()
+    print("ok cluster unequal")
+    test_clustered_coverage_invalid_and_g_lt_2()
+    print("ok cluster invalid/g<2")
+    test_evaluate_rolling_cluster_keys()
+    print("ok evaluate_rolling cluster keys")
     test_calibrate_fails_without_trusted_scores()
     print("ok cal fail")
     test_cpp_self_test_and_clean_capture()

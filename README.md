@@ -63,11 +63,11 @@ That drives the shipped GRU `train_step` / calibration / checkpoint / direct inf
 | `artifacts/truth.jsonl` | clean plant `(seq, x, y)` for oracle eval only |
 | `artifacts/series.jsonl` | reconstructed timeline from Rust |
 | `artifacts/checkpoint.npz` | trained GRU weights, norm stats, per-horizon `q_h` |
-| `artifacts/forecast.json` | one test origin: `x_mean_c`, `x_sigma_c`, `x_lo_c`, `x_hi_c`, `trust` per step |
+| `artifacts/forecast.json` | pipeline: one explicit test origin (`x_mean_c`, `x_sigma_c`, `x_lo_c`, `x_hi_c`, `trust` per step, plus optional retrospective fields) |
 | `artifacts/metrics.json` | rolling test-block observed vs oracle metrics |
 | `artifacts/budget.txt` / `artifacts/ram.txt` | peak working set, file sizes, `nvidia-smi` |
 
-Each `forecast.json` step is a calibrated interval in °C plus a trust probability in `[0, 1]`. When the run is a simulated holdout, steps also include `trust_true`, `x_observed_c`, and `x_oracle_c`. Top-level metadata includes `model_type`, `schema_version`, `nominal_coverage`, `origin_seq`, and `horizon`.
+Each step always has prediction fields: a calibrated interval in °C (`x_mean_c`, `x_sigma_c`, `x_lo_c`, `x_hi_c`) and a trust probability `trust` in `[0, 1]`. Calling `infer_forecast(params, meta, rows)` with no origin (or `origin_t=len(rows)`) forecasts the next `H` unseen ticks from available context only — those records omit labels. The default pipeline writes a representative labeled test-origin `forecast.json` by passing that origin explicitly. Retrospective records may include `trust_true` and simulator `x_oracle_c`; `x_observed_c` is present only when `trust_true >= 0.5` (a CRC-valid trusted measurement) and is omitted on held decoder ticks. Top-level metadata includes `model_type`, `schema_version`, `nominal_coverage`, `origin_seq`, and `horizon`.
 
 Intervals are **split-conformal-style**, not a coverage guarantee: serial dependence and drift violate exchangeability. See `REPORT.md`.
 

@@ -51,7 +51,7 @@ Training and calibration labels are reconstructed-stream values with the trust m
 - **`observed_*`**: trusted reconstructed test targets — the labels a deployment would have.
 - **`oracle_*`**: clean plant temperatures aligned by `seq` across trusted and held ticks — available only for this synthetic plant. A missing seq is an error; evaluation never compares by array index.
 
-Rolling metrics use non-overlapping test origins with stride `H`. `forecast.json` holds one representative origin; aggregates live in `metrics.json`.
+Rolling metrics use non-overlapping test origins with stride `H`. `forecast.json` from the default pipeline is one explicit test origin with retrospective simulator fields when the target row exists (`trust_true`, `x_oracle_c`; `x_observed_c` only on trusted ticks). A library call at the end of the reconstructed stream is prediction-only. Aggregates live in `metrics.json`.
 
 ## Negative catalog (not a clone)
 
@@ -104,15 +104,15 @@ Evidence from the recorded one-command run (`python siftcast.py --n 4096 --steps
 
 | Quantity | Recorded run | Ceiling |
 | --- | --- | --- |
-| Python peak working set | **44.941 MB** (`artifacts/budget.txt`) | 16 GB |
-| Python working set at budget | 44.277 MB | 16 GB |
-| GPU memory used / total (`nvidia-smi`) | **695 MiB / 6,141 MiB** | 6 GB VRAM |
+| Python peak working set | **45.004 MB** (`artifacts/budget.txt`) | 16 GB |
+| Python working set at budget | 44.641 MB | 16 GB |
+| GPU memory used / total (`nvidia-smi`) | **628 MiB / 6,141 MiB** | 6 GB VRAM |
 | CSV download / vendor | 67,921 B | — |
 | Capture | 50,734 B | — |
 | Checkpoint | 20,580 B (1776 params) | — |
-| Forecast JSON | 5,054 B | — |
+| Forecast JSON | 5,025 B | — |
 
-The 695 MiB VRAM figure is the desktop baseline. The process did not allocate GPU memory. Peak working set is ~0.28% of 16 GB. The heaviest files are a 203,264 B `sim.exe` and a 186,880 B `reconstruct.exe`. A second identical command byte-matched `checkpoint.npz`, `forecast.json`, and `metrics.json` (seed is fixed). Budget/RAM/`nvidia-smi` are machine-dependent and were not compared.
+The 628 MiB VRAM figure is the desktop baseline. The process did not allocate GPU memory. Peak working set is ~0.27% of 16 GB. The heaviest files are a 203,264 B `sim.exe` and a 186,880 B `reconstruct.exe`. A second identical command byte-matched `checkpoint.npz`, `forecast.json`, and `metrics.json` (seed is fixed). Budget/RAM/`nvidia-smi` are machine-dependent and were not compared.
 
 ## What the run learned
 
@@ -132,11 +132,12 @@ From `artifacts/metrics.json`:
 | Observed interval mean width (°C) | 11.400011775037257 | 526 |
 | Observed interval score (`alpha=0.10`) | 13.897768326441469 | 526 |
 | Train-climatology interval score | 16.586315390231647 | 526 |
-| Observed coverage Wilson 95% CI | [0.8032633812569494, 0.9771585570739174] | 38 origins |
+| Observed coverage cluster-robust 95% CI | [0.8960953155855503, 0.9632202737680619] | 38 origins |
+| Observed coverage CI method | `origin_cluster_robust_normal` | 38 origins |
 | Trust BCE / Brier | 0.4349318187950111 / 0.12993815084921917 | 608 |
 | Train-rate climatology Brier | 0.11735113084474427 | 608 |
 
-Oracle RMSE beats oracle persistence (2.949036602711687 < 3.7470802055883468). Observed interval score beats the train-climatology interval baseline (13.897768326441469 < 16.586315390231647). Nominal 0.90 lies inside the origin-clustered Wilson 95% interval. Hits inside one 16-step origin share context, so the Wilson sample size is `n_test_origins=38`, not the 526 pooled steps.
+Oracle RMSE beats oracle persistence (2.949036602711687 < 3.7470802055883468). Observed interval score beats the train-climatology interval baseline (13.897768326441469 < 16.586315390231647). Nominal 0.90 lies inside the origin-cluster-robust 95% interval on this run. Hits inside one 16-step origin share context; pooled coverage is `sum(h_i)/sum(n_i)` over the `G=38` non-empty origins, and the 95% interval is origin-cluster-robust normal (`origin_cluster_robust_normal`), not a binomial interval on the 526 pooled steps.
 
 Trust Brier **does not** beat the train-rate climatology Brier on this run (0.12993815084921917 vs 0.11735113084474427). The trust head is still trained and reported; it is not omitted because it lost that comparison. Packet trust on this channel is close to a constant rate (~0.85), and a 16-hidden GRU on a 12-tick window did not improve the Brier score over that rate.
 
@@ -146,7 +147,7 @@ Forecast records are task-shaped: each step has `x_mean_c`, `x_sigma_c>0`, order
 
 ## Limitations
 
-- Split-conformal-style intervals assume exchangeability. This series is serially dependent and the plant plus channel can drift across the 70/15/15 cut; the Wilson interval is an empirical check on this run, not a proof of valid coverage on other captures.
+- Split-conformal-style intervals assume exchangeability. This series is serially dependent and the plant plus channel can drift across the 70/15/15 cut. The origin-cluster-robust normal interval treats non-overlapping forecast origins as independent enough for the large-cluster approximation; it is an empirical check on this run, not a proof of valid coverage on other captures.
 - Oracle metrics exist only because the simulator wrote `truth.jsonl`. A real capture has `observed_*` only.
 - No claim of robustness across arbitrary channels, seeds, or horizons beyond the recorded default command.
 - No Bayesian weight posterior, cross-horizon covariance, or Monte Carlo rollout.

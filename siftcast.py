@@ -558,15 +558,37 @@ def interval_score(y: np.ndarray, lo: np.ndarray, hi: np.ndarray, alpha: float) 
     return width + extra
 
 
-def wilson_interval(k: float, n: int, z: float = 1.959963984540054) -> tuple:
-    if n <= 0:
-        raise ValueError("wilson CI requires n > 0")
-    phat = float(k) / float(n)
-    z2 = z * z
-    denom = 1.0 + z2 / float(n)
-    center = (phat + z2 / (2.0 * n)) / denom
-    marg = z * math.sqrt(phat * (1.0 - phat) / n + z2 / (4.0 * n * n)) / denom
-    return float(center - marg), float(center + marg)
+def clustered_coverage_interval(hit_counts, total_counts, z: float = 1.959963984540054) -> tuple:
+    """Origin-cluster-robust normal CI for pooled coverage p = sum(h_i)/sum(n_i).
+
+    Returns (p, lo, hi, n_origins). lo/hi are None when fewer than two
+    non-empty origins exist (point estimate is still returned).
+    """
+    hits = np.asarray(hit_counts, dtype=np.float64).reshape(-1)
+    totals = np.asarray(total_counts, dtype=np.float64).reshape(-1)
+    if hits.shape != totals.shape:
+        raise ValueError("hit_counts and total_counts must have the same length")
+    if np.any(~np.isfinite(hits)) or np.any(~np.isfinite(totals)):
+        raise ValueError("hit and total counts must be finite")
+    if np.any(hits < 0) or np.any(totals < 0):
+        raise ValueError("hit and total counts must be non-negative")
+    if np.any(hits > totals):
+        raise ValueError("hits cannot exceed totals")
+    nonempty = totals > 0
+    h = hits[nonempty]
+    n = totals[nonempty]
+    g = int(n.size)
+    n_sum = float(np.sum(n))
+    if n_sum <= 0:
+        raise ValueError("clustered coverage CI requires at least one observation")
+    p = float(np.sum(h) / n_sum)
+    if g < 2:
+        return p, None, None, g
+    u = h - p * n
+    se = math.sqrt((g / (g - 1.0)) * float(np.sum(u * u))) / n_sum
+    lo = float(min(1.0, max(0.0, p - z * se)))
+    hi = float(min(1.0, max(0.0, p + z * se)))
+    return p, lo, hi, g
 
 
 def predict_origin(params: dict, X: np.ndarray, t: int, win: int, horizon: int):
@@ -684,37 +706,47 @@ def _records_for_origins(params, meta, rows, X, origins, truth_by_seq):
     win = int(meta["win"])
     horizon = int(meta["horizon"])
     q = np.array(meta["q"], dtype=np.float64)
+    n = len(rows)
     recs = []
     for t in origins:
+        t = int(t)
+        if t < win or t > n:
+            raise ValueError(
+                f"origin_t={t} out of range; need {win} <= origin_t <= {n} "
+                f"(win={win}, len(rows)={n})"
+            )
         mu, sigma, p = predict_origin(params, X, t, win, horizon)
         mu_c, sig_c = _denorm_mu_sigma(mu, sigma, mean, std)
         lo_c = mu_c - q * sig_c
         hi_c = mu_c + q * sig_c
         persist = float(rows[t - 1]["x"])
         for h in range(horizon):
-            row = rows[t + h]
-            seq = int(row["seq"])
             rec = {
-                "origin_t": int(t),
+                "origin_t": t,
                 "step": h + 1,
-                "seq": seq,
                 "x_mean_c": float(mu_c[h]),
                 "x_sigma_c": float(sig_c[h]),
                 "x_lo_c": float(lo_c[h]),
                 "x_hi_c": float(hi_c[h]),
                 "trust": float(p[h]),
-                "trust_true": float(row["trust"]),
-                "x_observed_c": float(row["x"]),
-                "observed": float(row["trust"]) >= 0.5,
-                "persist_c": persist,
             }
-            if truth_by_seq is not None:
-                rec["x_oracle_c"] = oracle_x(truth_by_seq, seq)
+            idx = t + h
+            if idx < n:
+                row = rows[idx]
+                seq = int(row["seq"])
+                rec["seq"] = seq
+                rec["trust_true"] = float(row["trust"])
+                rec["observed"] = rec["trust_true"] >= 0.5
+                rec["persist_c"] = persist
+                if rec["observed"]:
+                    rec["x_observed_c"] = float(row["x"])
+                if truth_by_seq is not None:
+                    rec["x_oracle_c"] = oracle_x(truth_by_seq, seq)
             recs.append(rec)
     return recs
 
 
-def _public_step(rec: dict, include_truth: bool) -> dict:
+def _public_step(rec: dict) -> dict:
     out = {
         "step": rec["step"],
         "x_mean_c": rec["x_mean_c"],
@@ -723,31 +755,24 @@ def _public_step(rec: dict, include_truth: bool) -> dict:
         "x_hi_c": rec["x_hi_c"],
         "trust": rec["trust"],
     }
-    if include_truth:
-        out["trust_true"] = rec["trust_true"]
-        out["x_observed_c"] = rec["x_observed_c"]
-        if "x_oracle_c" in rec:
-            out["x_oracle_c"] = rec["x_oracle_c"]
+    for k in ("trust_true", "x_observed_c", "x_oracle_c"):
+        if k in rec:
+            out[k] = rec[k]
     return out
 
 
 def infer_forecast(params: dict, meta: dict, rows: list, truth_by_seq=None, origin_t=None) -> dict:
-    """Direct H-step forecast from one origin (first test origin by default)."""
+    """Direct H-step forecast from one origin (end of stream by default)."""
     mean = np.array(meta["mean"], dtype=np.float64)
     std = np.array(meta["std"], dtype=np.float64)
-    win = int(meta["win"])
     horizon = int(meta["horizon"])
-    split = meta["split"]
     X = series_matrix(rows, mean, std)
-    origins = iter_origins(len(rows), win, split["cal_end"], split["test_end"], horizon, stride=horizon)
     if origin_t is None:
-        if not origins:
-            raise RuntimeError("no test origins for forecast")
-        origin_t = int(origins[0])
-    recs = _records_for_origins(params, meta, rows, X, [int(origin_t)], truth_by_seq)
-    include_truth = any(r["origin_t"] + r["step"] - 1 < len(rows) for r in recs)
-    preds = [_public_step(r, include_truth=include_truth) for r in recs]
-    origin_seq = int(rows[int(origin_t) - 1]["seq"]) if origin_t else 0
+        origin_t = len(rows)
+    origin_t = int(origin_t)
+    recs = _records_for_origins(params, meta, rows, X, [origin_t], truth_by_seq)
+    preds = [_public_step(r) for r in recs]
+    origin_seq = int(rows[origin_t - 1]["seq"])
     return {
         "units": "deg_C",
         "model_type": MODEL_TYPE,
@@ -785,8 +810,13 @@ def evaluate_rolling(params: dict, meta: dict, rows: list, truth_by_seq: dict) -
     if not origins:
         raise RuntimeError("no test origins for evaluation")
     recs = _records_for_origins(params, meta, rows, X, origins, truth_by_seq)
-    if any("x_oracle_c" not in r for r in recs):
-        raise RuntimeError("oracle evaluation requires seq-aligned truth.jsonl")
+    for r in recs:
+        loc = f"origin_t={r.get('origin_t')} step={r.get('step')}"
+        for k in ("trust_true", "observed", "persist_c", "x_oracle_c"):
+            if k not in r:
+                raise RuntimeError(f"evaluate_rolling missing {k} on {loc}")
+        if r["observed"] and "x_observed_c" not in r:
+            raise RuntimeError(f"evaluate_rolling missing x_observed_c on trusted {loc}")
 
     obs = [r for r in recs if r["observed"]]
     if not obs:
@@ -814,14 +844,18 @@ def evaluate_rolling(params: dict, meta: dict, rows: list, truth_by_seq: dict) -
             ]
         )
     )
-    hits = sum(1 for r in obs if r["x_lo_c"] <= r["x_observed_c"] <= r["x_hi_c"])
     obs_n = len(obs)
-    obs_cov = float(hits) / float(obs_n)
-    # Hits within one origin share context and are not iid. The independent
-    # sampling units are the stride-H origins; Wilson uses that n with the
-    # same pooled coverage point estimate.
-    n_orig = len(origins)
-    wilson_lo, wilson_hi = wilson_interval(obs_cov * n_orig, n_orig)
+    hit_counts = []
+    total_counts = []
+    for t in origins:
+        recs_t = [r for r in recs if r["origin_t"] == t and r["observed"]]
+        n_i = len(recs_t)
+        h_i = sum(1 for r in recs_t if r["x_lo_c"] <= r["x_observed_c"] <= r["x_hi_c"])
+        hit_counts.append(h_i)
+        total_counts.append(n_i)
+    obs_cov, cluster_lo, cluster_hi, cluster_g = clustered_coverage_interval(
+        hit_counts, total_counts
+    )
     widths = np.array([r["x_hi_c"] - r["x_lo_c"] for r in obs], dtype=np.float64)
     mean_width = float(np.mean(widths))
     iscores = interval_score(
@@ -897,9 +931,10 @@ def evaluate_rolling(params: dict, meta: dict, rows: list, truth_by_seq: dict) -
         "observed_interval_coverage": obs_cov,
         "observed_interval_mean_width": mean_width,
         "observed_interval_score": mean_iscore,
-        "observed_coverage_wilson_lo": wilson_lo,
-        "observed_coverage_wilson_hi": wilson_hi,
-        "observed_coverage_wilson_n": int(n_orig),
+        "observed_coverage_cluster_lo": cluster_lo,
+        "observed_coverage_cluster_hi": cluster_hi,
+        "observed_coverage_cluster_n_origins": int(cluster_g),
+        "observed_coverage_cluster_method": "origin_cluster_robust_normal",
         "trust_n": len(recs),
         "trust_bce": trust_bce,
         "trust_brier": trust_brier,
@@ -1045,16 +1080,35 @@ def pipeline(
     print("siftcast: infer", flush=True)
     params2, meta2 = load_checkpoint(CKPT)
     truth_by_seq = load_truth_map(TRUTH)
-    result = infer_forecast(params2, meta2, rows, truth_by_seq=truth_by_seq)
+    split = meta2["split"]
+    test_origins = iter_origins(
+        len(rows),
+        int(meta2["win"]),
+        split["cal_end"],
+        split["test_end"],
+        int(meta2["horizon"]),
+        stride=int(meta2["horizon"]),
+    )
+    if not test_origins:
+        raise RuntimeError("no test origins for forecast")
+    result = infer_forecast(
+        params2, meta2, rows, truth_by_seq=truth_by_seq, origin_t=int(test_origins[0])
+    )
     metrics = evaluate_rolling(params2, meta2, rows, truth_by_seq)
     FORECAST.write_text(json.dumps(result, indent=2), encoding="utf-8")
     METRICS.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print("siftcast: forecast", json.dumps({k: result[k] for k in result if k != "forecast"}), flush=True)
+    clo = metrics["observed_coverage_cluster_lo"]
+    chi = metrics["observed_coverage_cluster_hi"]
+    if clo is None or chi is None:
+        ci_s = "null"
+    else:
+        ci_s = f"[{clo:.3f},{chi:.3f}]"
     print(
         f"siftcast: wrote {FORECAST} points={len(result['forecast'])} "
         f"oracle_rmse={metrics['oracle_rmse']:.4f} persist={metrics['oracle_persistence_rmse']:.4f} "
         f"obs_cov={metrics['observed_interval_coverage']:.3f} "
-        f"wilson=[{metrics['observed_coverage_wilson_lo']:.3f},{metrics['observed_coverage_wilson_hi']:.3f}]",
+        f"cluster_ci={ci_s}",
         flush=True,
     )
     write_budget({"metrics": metrics, "losses_head": losses[:3], "losses_tail": losses[-3:]})
